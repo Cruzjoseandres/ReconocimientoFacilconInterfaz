@@ -1,0 +1,912 @@
+Subject: [PATCH] Reconocimiento Facial Algoritmica
+---
+Index: logic.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/logic.py b/logic.py
+new file mode 100644
+--- /dev/null	(date 1748647271404)
++++ b/logic.py	(date 1748647271404)
+@@ -0,0 +1,184 @@
++import sqlite3
++import numpy as np
++import cv2
++from datetime import datetime
++
++class FaceAppLogic:
++    def __init__(self, db_path="rostrosv2.db"):
++        self.com = sqlite3.connect(db_path)
++        self.cursor = self.com.cursor()
++        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
++        # Crear el reconocedor LBPH
++        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
++        self.trained = False
++        self.label_map = {}
++        self.crear_tabla()
++        self.entrenar_modelo()
++
++    def crear_tabla(self):
++        self.cursor.execute('''
++            CREATE TABLE IF NOT EXISTS personas (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                nombre TEXT NOT NULL,
++                encoding BLOB NOT NULL,
++                habilitado INTEGER DEFAULT 1,
++                fecha_registro TEXT,
++                expirado INTEGER DEFAULT 0,
++                carnet_id TEXT
++            )
++        ''')
++        self.com.commit()
++
++    def cargar_rostros(self):
++        self.cursor.execute("SELECT nombre, encoding FROM personas")
++        datos = self.cursor.fetchall()
++        nombres = []
++        encodings = []
++        for nombre, encoding_blob in datos:
++            try:
++                encoding = np.frombuffer(encoding_blob, dtype=np.float64)
++                if len(encoding) != 10000:
++                    continue
++                nombres.append(nombre)
++                encodings.append(encoding)
++            except:
++                continue
++        return nombres, encodings
++
++    def entrenar_modelo(self):
++        """Entrena el reconocedor con los rostros almacenados en la BD"""
++        nombres, encodings = self.cargar_rostros()
++        if len(encodings) == 0:
++            self.trained = False
++            return
++
++        # Convertir encodings a imágenes para entrenar
++        faces = []
++        labels = []
++        label_dict = {}
++
++        for i, (nombre, encoding) in enumerate(zip(nombres, encodings)):
++            face_img = encoding.reshape(100, 100).astype(np.uint8)
++            if nombre not in label_dict:
++                label_dict[nombre] = len(label_dict)
++            label = label_dict[nombre]
++            faces.append(face_img)
++            labels.append(label)
++
++        if len(faces) > 0:
++            self.recognizer.train(faces, np.array(labels))
++            self.trained = True
++            self.label_map = {v: k for k, v in label_dict.items()}
++
++    def compare_faces(self, face1, face2, threshold=0.5):
++        if len(face1.shape) > 2:
++            face1 = cv2.cvtColor(face1, cv2.COLOR_BGR2GRAY)
++        if len(face2.shape) > 2:
++            face2 = cv2.cvtColor(face2, cv2.COLOR_BGR2GRAY)
++        face2 = cv2.resize(face2, (face1.shape[1], face1.shape[0]))
++        hist1 = cv2.calcHist([face1], [0], None, [256], [0, 256])
++        hist2 = cv2.calcHist([face2], [0], None, [256], [0, 256])
++        cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
++        cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
++        similarity = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
++        return similarity > threshold, similarity
++
++    def registrar_rostro(self, nombre, face_img):
++        """Registrar un nuevo rostro en la BD"""
++        if len(face_img.shape) > 2:
++            face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
++        face_resized = cv2.resize(face_img, (100, 100))
++        encoding = np.array(face_resized, dtype=np.float64).flatten()
++
++        fecha_registro = datetime.now().strftime("%Y-%m-%d")
++        carnet_id = ""  # Puedes pedirlo en otro campo si lo necesitas
++        self.cursor.execute(
++            "INSERT INTO personas (nombre, encoding, fecha_registro, carnet_id) VALUES (?, ?, ?, ?)",
++            (nombre, encoding.tobytes(), fecha_registro, carnet_id)
++        )
++        self.com.commit()
++        # Reentrenar el modelo con el nuevo rostro
++        self.entrenar_modelo()
++
++    def reconocer_rostro(self, face_img, confidence_threshold=80):
++        """Reconoce un rostro usando LBPH"""
++        if not self.trained:
++            return "Desconocido", 0
++
++        if len(face_img.shape) > 2:
++            face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
++        face_resized = cv2.resize(face_img, (100, 100))
++
++        try:
++            label, confidence = self.recognizer.predict(face_resized)
++            if confidence < confidence_threshold:  # Menor confianza = mejor coincidencia
++                nombre = self.label_map.get(label, "Desconocido")
++                return nombre, confidence
++        except Exception as e:
++            print(f"Error en reconocimiento: {e}")
++
++        return "Desconocido", 0
++
++    def obtener_info_persona(self, nombre):
++        self.cursor.execute(
++            "SELECT habilitado, fecha_registro, carnet_id FROM personas WHERE nombre = ?", (nombre,))
++        return self.cursor.fetchone()
++
++    def obtener_todas_personas(self):
++        self.cursor.execute("SELECT nombre, habilitado, fecha_registro, carnet_id FROM personas")
++        return self.cursor.fetchall()
++
++    def verificar_fechas_expiracion(self):
++        self.cursor.execute("SELECT id, fecha_registro, expirado FROM personas WHERE habilitado = 1")
++        filas = self.cursor.fetchall()
++        hoy = datetime.now()
++        for persona_id, fecha_str, expirado in filas:
++            if fecha_str:
++                fecha_registro = datetime.strptime(fecha_str, "%Y-%m-%d")
++                if (hoy - fecha_registro).days >= 30 and not expirado:
++                    self.cursor.execute(
++                        "UPDATE personas SET habilitado = 0, expirado = 1 WHERE id = ?",
++                        (persona_id,)
++                    )
++        self.com.commit()
++
++    def obtener_todas_personas_con_id(self):
++        """Obtiene todos los registros de personas incluyendo su ID"""
++        self.cursor.execute("SELECT id, nombre, habilitado, fecha_registro, carnet_id FROM personas")
++        return self.cursor.fetchall()
++
++    def registrar_rostro_con_carnet(self, nombre, face_img, carnet_id=""):
++        """Registra un nuevo rostro en la BD con carnet"""
++        if len(face_img.shape) > 2:
++            face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
++        face_resized = cv2.resize(face_img, (100, 100))
++        encoding = np.array(face_resized, dtype=np.float64).flatten()
++
++        fecha_registro = datetime.now().strftime("%Y-%m-%d")
++        self.cursor.execute(
++            "INSERT INTO personas (nombre, encoding, fecha_registro, carnet_id) VALUES (?, ?, ?, ?)",
++            (nombre, encoding.tobytes(), fecha_registro, carnet_id)
++        )
++        self.com.commit()
++        # Reentrenar el modelo con el nuevo rostro
++        self.entrenar_modelo()
++
++    def actualizar_persona(self, id_persona, nombre, carnet_id=""):
++        """Actualiza la información de una persona"""
++        self.cursor.execute(
++            "UPDATE personas SET nombre = ?, carnet_id = ? WHERE id = ?",
++            (nombre, carnet_id, id_persona)
++        )
++        self.com.commit()
++        # Actualizar el modelo si cambió el nombre
++        self.entrenar_modelo()
++
++    def eliminar_persona(self, id_persona):
++        """Elimina a una persona de la base de datos"""
++        self.cursor.execute("DELETE FROM personas WHERE id = ?", (id_persona,))
++        self.com.commit()
++        # Reentrenar el modelo porque eliminamos una persona
++        self.entrenar_modelo()
++
++    def cerrar(self):
++        self.com.close()
+\ No newline at end of file
+Index: ui.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/ui.py b/ui.py
+new file mode 100644
+--- /dev/null	(date 1748647524188)
++++ b/ui.py	(date 1748647524188)
+@@ -0,0 +1,214 @@
++import tkinter as tk
++from tkinter import messagebox, ttk
++from PIL import Image, ImageTk
++import cv2
++import numpy as np
++from datetime import datetime, timedelta
++from logic import FaceAppLogic
++from admin import AdminWindow
++
++class FaceAppUI:
++    def __init__(self, root, logic: FaceAppLogic):
++        self.root = root
++        self.logic = logic
++        self.root.title("Registro facial")
++        self.root.geometry("1000x600")
++
++        self.main_frame = tk.Frame(self.root)
++        self.main_frame.pack(fill=tk.BOTH, expand=True)
++
++        self.video_frame = tk.Frame(self.main_frame)
++        self.video_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
++
++        self.label_video = tk.Label(self.video_frame)
++        self.label_video.pack(padx=10, pady=10, expand=True)
++
++        self.control_frame = tk.Frame(self.main_frame, bg="#f0f0f0")
++        self.control_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=10)
++
++        self.entry_name = tk.Entry(self.control_frame, font=("Arial", 12))
++        self.entry_name.pack(pady=10)
++        self.entry_name.insert(0, "Nombre de la persona")
++
++        self.button_register = tk.Button(
++            self.control_frame, text="Registrar Rostro", command=self.registrar_rostro,
++            bg="blue", fg="white", font=("Arial", 12), width=20)
++        self.button_register.pack(pady=5)
++
++        self.entry_update = tk.Entry(self.control_frame, font=("Arial", 12))
++        self.entry_update.pack(pady=20)
++        self.entry_update.insert(0, "Nombre para actualizar")
++
++        self.button_habilitar = tk.Button(
++            self.control_frame, text="Habilitar acceso", command=self.habilitar_acceso,
++            bg="green", fg="white", font=("Arial", 12), width=20)
++        self.button_habilitar.pack(pady=5)
++
++        self.button_deshabilitar = tk.Button(
++            self.control_frame, text="Deshabilitar acceso", command=self.deshabilitar_acceso,
++            bg="red", fg="white", font=("Arial", 12), width=20)
++        self.button_deshabilitar.pack(pady=5)
++
++        self.entry_dias = tk.Entry(self.control_frame, font=("Arial", 12))
++        self.entry_dias.pack(pady=10)
++        self.entry_dias.insert(0, "Días disponibles")
++
++        self.button_actualizar_dias = tk.Button(
++            self.control_frame, text="Actualizar días disponibles", command=self.actualizar_dias_disponibles,
++            bg="#FFA500", fg="white", font=("Arial", 12), width=25)
++        self.button_actualizar_dias.pack(pady=5)
++
++        self.button_admin = tk.Button(
++            self.control_frame, text="Administrador", command=self.mostrar_admin,
++            bg="#6A5ACD", fg="white", font=("Arial", 12), width=20)
++        self.button_admin.pack(pady=15)
++
++        self.cap = cv2.VideoCapture(0)
++        self.current_frame = None
++        self.face_locations_actual = None
++
++        self.admin_window = AdminWindow(self.root, self.logic, self.cap)
++
++        self.ventana_admin = None
++        self.root.protocol("WM_DELETE_WINDOW", self.cerrar_aplicacion)
++        self.root.bind('<Control-a>', self.mostrar_admin)
++
++        self.actualizar_video()
++
++    def actualizar_video(self):
++        self.logic.verificar_fechas_expiracion()
++        ret, frame = self.cap.read()
++        if not ret:
++            self.root.after(30, self.actualizar_video)
++            return
++
++        display_frame = frame.copy()
++        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
++        faces = self.logic.face_cascade.detectMultiScale(
++            gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
++        )
++        self.face_locations_actual = faces
++
++        for (x, y, w, h) in faces:
++            nombre = "Desconocido"
++            color = (0, 255, 0)
++            face_roi = frame[y:y + h, x:x + w]
++
++            if face_roi.size > 0:
++                # Usar el nuevo método de reconocimiento
++                nombre_bd, confidence = self.logic.reconocer_rostro(face_roi)
++
++                if nombre_bd != "Desconocido":
++                    result = self.logic.obtener_info_persona(nombre_bd)
++                    if result:
++                        habilitado, fecha_registro, carnet_id = result
++                        dias_restantes = "?"
++                        if fecha_registro:
++                            fecha = datetime.strptime(fecha_registro, "%Y-%m-%d")
++                            dias_restantes = 30 - (datetime.now() - fecha).days
++                            if dias_restantes <= 0:
++                                dias_restantes = 0
++                        if habilitado == 0:
++                            nombre = f"{nombre_bd} (Acceso denegado)"
++                            color = (0, 0, 255)
++                        elif dias_restantes <= 5:
++                            nombre = f"{nombre_bd} ({dias_restantes} dias)"
++                            color = (0, 255, 255)
++                        else:
++                            nombre = f"{nombre_bd} ({dias_restantes} dias)"
++                            color = (0, 255, 0)
++
++            cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
++            cv2.putText(display_frame, nombre, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
++
++        self.current_frame = display_frame
++        img = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
++        img = Image.fromarray(img)
++        imgtk = ImageTk.PhotoImage(image=img)
++        self.label_video.imgtk = imgtk
++        self.label_video.configure(image=imgtk)
++        self.root.after(30, self.actualizar_video)
++
++    def mostrar_admin(self):
++        if not hasattr(self, 'admin_window'):
++            self.admin_window = AdminWindow(self.root, self.logic, self.cap)
++        self.admin_window.show()
++
++    def registrar_rostro(self):
++        nombre = self.entry_name.get().strip()
++        if not nombre or nombre == "Nombre de la persona":
++            messagebox.showwarning("Advertencia", "Ingrese un nombre válido.")
++            return
++
++        ret, frame = self.cap.read()
++        if not ret:
++            messagebox.showerror("Error", "No se pudo capturar imagen de la cámara.")
++            return
++
++        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
++        faces = self.logic.face_cascade.detectMultiScale(gray, 1.1, 5)
++
++        if len(faces) == 0:
++            messagebox.showinfo("Info", "No se detectó ningún rostro.")
++            return
++
++        x, y, w, h = faces[0]
++        face_roi = gray[y:y+h, x:x+w]
++        # Usar el nuevo método de registrar rostro
++        try:
++            self.logic.registrar_rostro(nombre, face_roi)
++            messagebox.showinfo("Éxito", f"Rostro de {nombre} registrado correctamente.")
++        except Exception as e:
++            messagebox.showerror("Error", f"No se pudo registrar el rostro: {e}")
++
++    def habilitar_acceso(self):
++        nombre = self.entry_update.get().strip()
++        if not nombre or nombre == "Nombre para actualizar":
++            messagebox.showwarning("Advertencia", "Ingrese un nombre válido.")
++            return
++        self.logic.cursor.execute(
++            "UPDATE personas SET habilitado = 1, expirado = 0 WHERE nombre = ?", (nombre,))
++        self.logic.com.commit()
++        messagebox.showinfo("Éxito", f"Acceso habilitado para {nombre}.")
++
++    def deshabilitar_acceso(self):
++        nombre = self.entry_update.get().strip()
++        if not nombre or nombre == "Nombre para actualizar":
++            messagebox.showwarning("Advertencia", "Ingrese un nombre válido.")
++            return
++        self.logic.cursor.execute(
++            "UPDATE personas SET habilitado = 0 WHERE nombre = ?", (nombre,))
++        self.logic.com.commit()
++        messagebox.showinfo("Éxito", f"Acceso deshabilitado para {nombre}.")
++
++    def actualizar_dias_disponibles(self):
++        nombre = self.entry_update.get().strip()
++        dias = self.entry_dias.get().strip()
++        if not nombre or nombre == "Nombre para actualizar":
++            messagebox.showwarning("Advertencia", "Ingrese un nombre válido.")
++            return
++        try:
++            dias = int(dias)
++            if dias < 0:
++                raise ValueError
++        except ValueError:
++            messagebox.showwarning("Advertencia", "Ingrese un número de días válido.")
++            return
++        fecha_nueva = (datetime.now() - timedelta(days=30 - dias)).strftime("%Y-%m-%d")
++        self.logic.cursor.execute(
++            "UPDATE personas SET fecha_registro = ?, habilitado = 1, expirado = 0 WHERE nombre = ?",
++            (fecha_nueva, nombre)
++        )
++        self.logic.com.commit()
++        messagebox.showinfo("Éxito", f"Días disponibles actualizados para {nombre}.")
++
++
++
++
++    def cerrar_aplicacion(self):
++        self.cap.release()
++        self.logic.cerrar()
++        self.root.quit()
++
++
++
+Index: main.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/main.py b/main.py
+new file mode 100644
+--- /dev/null	(date 1748647271436)
++++ b/main.py	(date 1748647271436)
+@@ -0,0 +1,10 @@
++import tkinter as tk
++from logic import FaceAppLogic
++from ui import FaceAppUI
++
++
++if __name__ == "__main__":
++    root = tk.Tk()
++    logic = FaceAppLogic()
++    app = FaceAppUI(root, logic)
++    root.mainloop()
+\ No newline at end of file
+Index: .idea/ReconocimientoFacilconInterfaz.iml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.idea/ReconocimientoFacilconInterfaz.iml b/.idea/ReconocimientoFacilconInterfaz.iml
+new file mode 100644
+--- /dev/null	(date 1748642025318)
++++ b/.idea/ReconocimientoFacilconInterfaz.iml	(date 1748642025318)
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<module type="PYTHON_MODULE" version="4">
++  <component name="NewModuleRootManager">
++    <content url="file://$MODULE_DIR$" />
++    <orderEntry type="jdk" jdkName="Python 3.13 (ReconocimientoFacilconInterfaz)" jdkType="Python SDK" />
++    <orderEntry type="sourceFolder" forTests="false" />
++  </component>
++</module>
+\ No newline at end of file
+Index: .idea/inspectionProfiles/profiles_settings.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.idea/inspectionProfiles/profiles_settings.xml b/.idea/inspectionProfiles/profiles_settings.xml
+new file mode 100644
+--- /dev/null	(date 1748616163409)
++++ b/.idea/inspectionProfiles/profiles_settings.xml	(date 1748616163409)
+@@ -0,0 +1,6 @@
++<component name="InspectionProjectProfileManager">
++  <settings>
++    <option name="USE_PROJECT_PROFILE" value="false" />
++    <version value="1.0" />
++  </settings>
++</component>
+\ No newline at end of file
+Index: .idea/modules.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.idea/modules.xml b/.idea/modules.xml
+new file mode 100644
+--- /dev/null	(date 1748616163284)
++++ b/.idea/modules.xml	(date 1748616163284)
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project version="4">
++  <component name="ProjectModuleManager">
++    <modules>
++      <module fileurl="file://$PROJECT_DIR$/.idea/ReconocimientoFacilconInterfaz.iml" filepath="$PROJECT_DIR$/.idea/ReconocimientoFacilconInterfaz.iml" />
++    </modules>
++  </component>
++</project>
+\ No newline at end of file
+Index: .idea/workspace.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.idea/workspace.xml b/.idea/workspace.xml
+new file mode 100644
+--- /dev/null	(date 1748648311054)
++++ b/.idea/workspace.xml	(date 1748648311054)
+@@ -0,0 +1,130 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project version="4">
++  <component name="AutoImportSettings">
++    <option name="autoReloadType" value="SELECTIVE" />
++  </component>
++  <component name="ChangeListManager">
++    <list default="true" id="86048984-45d6-4c05-aba8-1100918182af" name="Changes" comment="">
++      <change afterPath="$PROJECT_DIR$/.idea/ReconocimientoFacilconInterfaz.iml" afterDir="false" />
++      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
++      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
++      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
++      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
++      <change afterPath="$PROJECT_DIR$/admin.py" afterDir="false" />
++      <change afterPath="$PROJECT_DIR$/logic.py" afterDir="false" />
++      <change afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
++      <change afterPath="$PROJECT_DIR$/ui.py" afterDir="false" />
++    </list>
++    <option name="SHOW_DIALOG" value="false" />
++    <option name="HIGHLIGHT_CONFLICTS" value="true" />
++    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
++    <option name="LAST_RESOLUTION" value="IGNORE" />
++  </component>
++  <component name="FileTemplateManagerImpl">
++    <option name="RECENT_TEMPLATES">
++      <list>
++        <option value="Python Script" />
++      </list>
++    </option>
++  </component>
++  <component name="Git.Settings">
++    <excluded-from-favorite>
++      <branch-storage>
++        <map>
++          <entry type="LOCAL">
++            <value>
++              <list>
++                <branch-info repo="$PROJECT_DIR$" source="master" />
++              </list>
++            </value>
++          </entry>
++        </map>
++      </branch-storage>
++    </excluded-from-favorite>
++    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
++  </component>
++  <component name="ProjectColorInfo">{
++  &quot;associatedIndex&quot;: 5
++}</component>
++  <component name="ProjectId" id="2xotGLOohNjasttPNSHoqKqvH81" />
++  <component name="ProjectViewState">
++    <option name="hideEmptyMiddlePackages" value="true" />
++    <option name="showLibraryContents" value="true" />
++  </component>
++  <component name="PropertiesComponent"><![CDATA[{
++  "keyToString": {
++    "ModuleVcsDetector.initialDetectionPerformed": "true",
++    "Python.logic.executor": "Run",
++    "Python.main.executor": "Run",
++    "Python.ui.executor": "Run",
++    "RunOnceActivity.ShowReadmeOnStart": "true",
++    "RunOnceActivity.git.unshallow": "true",
++    "git-widget-placeholder": "master",
++    "node.js.detected.package.eslint": "true",
++    "node.js.detected.package.tslint": "true",
++    "node.js.selected.package.eslint": "(autodetect)",
++    "node.js.selected.package.tslint": "(autodetect)",
++    "nodejs_package_manager_path": "npm",
++    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable",
++    "vue.rearranger.settings.migration": "true"
++  }
++}]]></component>
++  <component name="RunManager">
++    <configuration name="main" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
++      <module name="ReconocimientoFacilconInterfaz" />
++      <option name="ENV_FILES" value="" />
++      <option name="INTERPRETER_OPTIONS" value="" />
++      <option name="PARENT_ENVS" value="true" />
++      <envs>
++        <env name="PYTHONUNBUFFERED" value="1" />
++      </envs>
++      <option name="SDK_HOME" value="" />
++      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
++      <option name="IS_MODULE_SDK" value="true" />
++      <option name="ADD_CONTENT_ROOTS" value="true" />
++      <option name="ADD_SOURCE_ROOTS" value="true" />
++      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
++      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/main.py" />
++      <option name="PARAMETERS" value="" />
++      <option name="SHOW_COMMAND_LINE" value="false" />
++      <option name="EMULATE_TERMINAL" value="false" />
++      <option name="MODULE_MODE" value="false" />
++      <option name="REDIRECT_INPUT" value="false" />
++      <option name="INPUT_FILE" value="" />
++      <method v="2" />
++    </configuration>
++    <recent_temporary>
++      <list>
++        <item itemvalue="Python.main" />
++      </list>
++    </recent_temporary>
++  </component>
++  <component name="SharedIndexes">
++    <attachedChunks>
++      <set>
++        <option value="bundled-js-predefined-d6986cc7102b-6a121458b545-JavaScript-PY-251.25410.159" />
++        <option value="bundled-python-sdk-e0ed3721d81e-36ea0e71a18c-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-251.25410.159" />
++      </set>
++    </attachedChunks>
++  </component>
++  <component name="TaskManager">
++    <task active="true" id="Default" summary="Default task">
++      <changelist id="86048984-45d6-4c05-aba8-1100918182af" name="Changes" comment="" />
++      <created>1748616156946</created>
++      <option name="number" value="Default" />
++      <option name="presentableId" value="Default" />
++      <updated>1748616156946</updated>
++      <workItem from="1748616158300" duration="7418000" />
++      <workItem from="1748629321597" duration="10011000" />
++    </task>
++    <servers />
++  </component>
++  <component name="TypeScriptGeneratedFilesManager">
++    <option name="version" value="3" />
++  </component>
++  <component name="com.intellij.coverage.CoverageDataManagerImpl">
++    <SUITE FILE_PATH="coverage/ReconocimientoFacilconInterfaz$ui.coverage" NAME="ui Coverage Results" MODIFIED="1748636892943" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
++    <SUITE FILE_PATH="coverage/ReconocimientoFacilconInterfaz$logic.coverage" NAME="logic Coverage Results" MODIFIED="1748636744681" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
++    <SUITE FILE_PATH="coverage/ReconocimientoFacilconInterfaz$main.coverage" NAME="main Coverage Results" MODIFIED="1748647737922" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
++  </component>
++</project>
+\ No newline at end of file
+Index: admin.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/admin.py b/admin.py
+new file mode 100644
+--- /dev/null	(date 1748647271420)
++++ b/admin.py	(date 1748647271420)
+@@ -0,0 +1,246 @@
++import tkinter as tk
++from tkinter import messagebox, ttk
++import cv2
++from PIL import Image, ImageTk
++from datetime import datetime
++
++
++class AdminWindow:
++    def __init__(self, parent, logic, camera):
++        """
++        Inicializa la ventana de administración
++
++        Args:
++            parent: Ventana principal de la aplicación
++            logic: Instancia de FaceAppLogic
++            camera: Instancia de la cámara (cv2.VideoCapture)
++        """
++        self.parent = parent
++        self.logic = logic
++        self.cap = camera
++        self.window = None
++
++    def show(self):
++        """Muestra la ventana de administración"""
++        if self.window:
++            self.window.deiconify()
++            self.refrescar_tabla()
++            return
++
++        self.window = tk.Toplevel(self.parent)
++        self.window.title("Administrador de Rostros")
++        self.window.geometry("900x500")
++
++        # Frame superior con la tabla
++        frame_tabla = tk.Frame(self.window)
++        frame_tabla.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
++
++        # Crear tabla con scrollbar
++        scrollbar = ttk.Scrollbar(frame_tabla)
++        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
++
++        # Tabla mejorada
++        self.tree = ttk.Treeview(frame_tabla,
++                                 columns=("ID", "Nombre", "Estado", "Días Restantes", "Carnet ID"),
++                                 show="headings",
++                                 yscrollcommand=scrollbar.set)
++        scrollbar.config(command=self.tree.yview)
++
++        self.tree.pack(fill=tk.BOTH, expand=True)
++        self.tree.heading("ID", text="ID")
++        self.tree.heading("Nombre", text="Nombre")
++        self.tree.heading("Estado", text="Estado")
++        self.tree.heading("Días Restantes", text="Días Restantes")
++        self.tree.heading("Carnet ID", text="Carnet ID")
++
++        # Ajustar ancho de columnas
++        self.tree.column("ID", width=50)
++        self.tree.column("Nombre", width=150)
++        self.tree.column("Estado", width=100)
++        self.tree.column("Días Restantes", width=120)
++        self.tree.column("Carnet ID", width=120)
++
++        # Frame inferior con formulario CRUD
++        frame_crud = tk.Frame(self.window)
++        frame_crud.pack(fill=tk.X, padx=10, pady=10)
++
++        # Campos de formulario
++        tk.Label(frame_crud, text="ID:").grid(row=0, column=0, padx=5, pady=5)
++        self.entry_id = tk.Entry(frame_crud, width=10)
++        self.entry_id.grid(row=0, column=1, padx=5, pady=5)
++
++        tk.Label(frame_crud, text="Nombre:").grid(row=0, column=2, padx=5, pady=5)
++        self.entry_nombre = tk.Entry(frame_crud, width=20)
++        self.entry_nombre.grid(row=0, column=3, padx=5, pady=5)
++
++        tk.Label(frame_crud, text="Carnet:").grid(row=0, column=4, padx=5, pady=5)
++        self.entry_carnet = tk.Entry(frame_crud, width=20)
++        self.entry_carnet.grid(row=0, column=5, padx=5, pady=5)
++
++        # Frame para botones
++        frame_botones = tk.Frame(self.window)
++        frame_botones.pack(fill=tk.X, padx=10, pady=10)
++
++        # Botones CRUD
++        self.btn_nuevo = tk.Button(frame_botones, text="Nuevo", command=self.nuevo_registro,
++                                   bg="#4CAF50", fg="white", width=15)
++        self.btn_nuevo.pack(side=tk.LEFT, padx=5)
++
++        self.btn_actualizar = tk.Button(frame_botones, text="Actualizar", command=self.actualizar_registro,
++                                        bg="#2196F3", fg="white", width=15)
++        self.btn_actualizar.pack(side=tk.LEFT, padx=5)
++
++        self.btn_eliminar = tk.Button(frame_botones, text="Eliminar", command=self.eliminar_registro,
++                                      bg="#F44336", fg="white", width=15)
++        self.btn_eliminar.pack(side=tk.LEFT, padx=5)
++
++        self.btn_refrescar = tk.Button(frame_botones, text="Refrescar", command=self.refrescar_tabla,
++                                       bg="#9E9E9E", fg="white", width=15)
++        self.btn_refrescar.pack(side=tk.RIGHT, padx=5)
++
++        # Vincular evento de selección de fila
++        self.tree.bind("<<TreeviewSelect>>", self.seleccionar_fila)
++
++        # Cargar datos
++        self.refrescar_tabla()
++
++    def seleccionar_fila(self, event):
++        selected = self.tree.selection()
++        if not selected:
++            return
++
++        item = self.tree.item(selected[0])
++        valores = item['values']
++
++        # Limpia y llena los campos
++        self.entry_id.delete(0, tk.END)
++        self.entry_nombre.delete(0, tk.END)
++        self.entry_carnet.delete(0, tk.END)
++
++        self.entry_id.insert(0, valores[0])
++        self.entry_nombre.insert(0, valores[1])
++        self.entry_carnet.insert(0, valores[4] if valores[4] else "")
++
++    def refrescar_tabla(self):
++        # Limpia la tabla
++        for i in self.tree.get_children():
++            self.tree.delete(i)
++
++        # Obtiene datos actualizados incluyendo ID
++        filas = self.logic.obtener_todas_personas_con_id()
++        for fila in filas:
++            id_persona, nombre, habilitado, fecha_registro, carnet_id = fila
++            dias_restantes = "?"
++            if fecha_registro:
++                fecha = datetime.strptime(fecha_registro, "%Y-%m-%d")
++                dias_restantes = 30 - (datetime.now() - fecha).days
++                if dias_restantes <= 0:
++                    dias_restantes = "Expirado"
++            estado = "Activo" if habilitado else "Deshabilitado"
++            self.tree.insert("", "end", values=(id_persona, nombre, estado, dias_restantes, carnet_id))
++
++    def nuevo_registro(self):
++        # Abre ventana para capturar nuevo rostro
++        nombre = self.entry_nombre.get().strip()
++        carnet_id = self.entry_carnet.get().strip()
++
++        if not nombre:
++            messagebox.showwarning("Advertencia", "Ingrese un nombre válido.")
++            return
++
++        # Capturar rostro
++        top = tk.Toplevel(self.window)
++        top.title("Capturar Rostro")
++        top.geometry("500x400")
++
++        label_video_capture = tk.Label(top)
++        label_video_capture.pack(pady=10)
++
++        def actualizar_captura():
++            ret, frame = self.cap.read()
++            if ret:
++                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
++                faces = self.logic.face_cascade.detectMultiScale(
++                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
++                )
++
++                frame_copia = frame.copy()
++                for (x, y, w, h) in faces:
++                    cv2.rectangle(frame_copia, (x, y), (x + w, y + h), (0, 255, 0), 2)
++
++                img = cv2.cvtColor(frame_copia, cv2.COLOR_BGR2RGB)
++                img = Image.fromarray(img)
++                imgtk = ImageTk.PhotoImage(image=img)
++                label_video_capture.imgtk = imgtk
++                label_video_capture.configure(image=imgtk)
++                label_video_capture.img = imgtk
++                top.after(30, actualizar_captura)
++
++        def capturar():
++            ret, frame = self.cap.read()
++            if not ret:
++                messagebox.showerror("Error", "No se pudo capturar imagen de la cámara.")
++                return
++
++            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
++            faces = self.logic.face_cascade.detectMultiScale(gray, 1.1, 5)
++
++            if len(faces) == 0:
++                messagebox.showinfo("Info", "No se detectó ningún rostro.")
++                return
++
++            x, y, w, h = faces[0]
++            face_roi = gray[y:y + h, x:x + w]
++
++            try:
++                self.logic.registrar_rostro_con_carnet(nombre, face_roi, carnet_id)
++                messagebox.showinfo("Éxito", f"Rostro de {nombre} registrado correctamente.")
++                top.destroy()
++                self.refrescar_tabla()
++            except Exception as e:
++                messagebox.showerror("Error", f"No se pudo registrar el rostro: {e}")
++
++        actualizar_captura()
++
++        btn_capturar = tk.Button(top, text="Capturar", command=capturar,
++                                 bg="#4CAF50", fg="white", width=15)
++        btn_capturar.pack(pady=10)
++
++    def actualizar_registro(self):
++        id_persona = self.entry_id.get().strip()
++        nombre = self.entry_nombre.get().strip()
++        carnet_id = self.entry_carnet.get().strip()
++
++        if not id_persona or not nombre:
++            messagebox.showwarning("Advertencia", "Seleccione un registro válido.")
++            return
++
++        try:
++            self.logic.actualizar_persona(id_persona, nombre, carnet_id)
++            messagebox.showinfo("Éxito", "Registro actualizado correctamente.")
++            self.refrescar_tabla()
++        except Exception as e:
++            messagebox.showerror("Error", f"No se pudo actualizar el registro: {e}")
++
++    def eliminar_registro(self):
++        id_persona = self.entry_id.get().strip()
++
++        if not id_persona:
++            messagebox.showwarning("Advertencia", "Seleccione un registro válido.")
++            return
++
++        confirmacion = messagebox.askyesno("Confirmar",
++                                           "¿Está seguro que desea eliminar este registro? Esta acción no se puede deshacer.")
++
++        if confirmacion:
++            try:
++                self.logic.eliminar_persona(id_persona)
++                messagebox.showinfo("Éxito", "Registro eliminado correctamente.")
++                self.refrescar_tabla()
++
++                # Limpia los campos
++                self.entry_id.delete(0, tk.END)
++                self.entry_nombre.delete(0, tk.END)
++                self.entry_carnet.delete(0, tk.END)
++            except Exception as e:
++                messagebox.showerror("Error", f"No se pudo eliminar el registro: {e}")
+\ No newline at end of file
+Index: .idea/vcs.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.idea/vcs.xml b/.idea/vcs.xml
+new file mode 100644
+--- /dev/null	(date 1748616163456)
++++ b/.idea/vcs.xml	(date 1748616163456)
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project version="4">
++  <component name="VcsDirectoryMappings">
++    <mapping directory="$PROJECT_DIR$" vcs="Git" />
++  </component>
++</project>
+\ No newline at end of file
